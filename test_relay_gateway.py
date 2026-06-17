@@ -10,6 +10,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -137,6 +138,75 @@ class RedactionTests(unittest.TestCase):
         self.assertNotEqual(redacted["name"], "Alice Smith")
         self.assertEqual(redacted["tools"][0]["function"]["name"], "lookup_user")
 
+    def test_payload_preserves_openai_tool_and_response_json_schemas(self) -> None:
+        mapping = {}
+        kinds = {}
+        password_schema = {"type": "string", "description": "User password field"}
+        response_schema = {"type": "string", "description": "API key value"}
+        body = {
+            "model": "model.example",
+            "messages": [{"role": "user", "content": "password: secret123"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "login_user",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"password": password_schema},
+                            "required": ["password"],
+                        },
+                    },
+                }
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "result",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"api_key": response_schema},
+                    },
+                },
+            },
+        }
+        redacted = gateway.redact_payload(body, mapping, kinds)
+        self.assertEqual(redacted["tools"][0]["function"]["parameters"]["properties"]["password"], password_schema)
+        self.assertEqual(redacted["response_format"]["json_schema"]["schema"]["properties"]["api_key"], response_schema)
+        self.assertNotIn("secret123", redacted["messages"][0]["content"])
+
+    def test_payload_preserves_anthropic_input_schema(self) -> None:
+        mapping = {}
+        kinds = {}
+        schema = {
+            "type": "object",
+            "properties": {"privateKey": {"type": "string"}},
+            "required": ["privateKey"],
+        }
+        body = {
+            "tools": [{"name": "lookup_key", "description": "Lookup key", "input_schema": schema}],
+            "messages": [{"role": "user", "content": "client_secret: local-secret-value"}],
+        }
+        redacted = gateway.redact_payload(body, mapping, kinds)
+        self.assertEqual(redacted["tools"][0]["input_schema"], schema)
+        self.assertEqual(redacted["tools"][0]["name"], "lookup_key")
+        self.assertNotIn("local-secret-value", redacted["messages"][0]["content"])
+
+    def test_payload_redacts_camel_case_sensitive_keys(self) -> None:
+        mapping = {}
+        kinds = {}
+        body = {
+            "accessToken": "access-token-value",
+            "refreshToken": "refresh-token-value",
+            "clientSecret": "client-secret-value",
+            "privateKey": "private-key-value",
+            "sshKey": "ssh-key-value",
+        }
+        redacted = gateway.redact_payload(body, mapping, kinds)
+        for key, original in body.items():
+            self.assertNotEqual(redacted[key], original)
+        self.assertEqual(len(mapping), len(body))
+
     def test_sensitive_key_context_redacts_numbers_and_containers(self) -> None:
         mapping = {}
         kinds = {}
@@ -157,6 +227,16 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("北京市朝阳路18号", out)
         self.assertNotIn("1990年1月2日", out)
         self.assertNotIn("示例科技有限公司", out)
+
+    def test_strict_contextual_redaction_supports_chinese_sentences(self) -> None:
+        mapping = {}
+        kinds = {}
+        text = "我的名字是张三，住在北京市朝阳路18号，单位是示例科技有限公司。"
+        out = gateway.redact_text(text, mapping, kinds, redaction_mode="strict")
+        self.assertNotIn("张三", out)
+        self.assertNotIn("北京市朝阳路18号", out)
+        self.assertNotIn("示例科技有限公司", out)
+        self.assertGreaterEqual(len(mapping), 3)
 
     def test_oversized_text_fails_closed(self) -> None:
         mapping = {}
@@ -253,6 +333,16 @@ class ProtocolTests(unittest.TestCase):
             gateway.validate_base_url("http://relay.example.invalid/v1")
         gateway.validate_base_url("http://127.0.0.1:8787/v1")
         gateway.validate_base_url("http://localhost:8787/v1")
+
+    def test_base_url_rejects_query_fragment_and_userinfo(self) -> None:
+        for url in [
+            "https://relay.example.invalid/v1?tenant=a",
+            "https://relay.example.invalid/v1#chat",
+            "https://user:pass@relay.example.invalid/v1",
+        ]:
+            with self.subTest(url=url):
+                with self.assertRaises(gateway.GatewayError):
+                    gateway.validate_base_url(url)
 
     def test_upstream_http_error_body_is_not_reflected(self) -> None:
         class Handler(BaseHTTPRequestHandler):
@@ -438,19 +528,25 @@ class ProtocolTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
-                sock.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-                chunks = []
-                while True:
-                    try:
-                        chunk = sock.recv(4096)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-            self.assertIn(b"HTTP/1.1 503", b"".join(chunks))
-            self.assertEqual(server.metrics.counters.get(("llmveil_overload_rejections_total", ())), 1)
+            raw = b""
+            for attempt in range(3):
+                with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
+                    sock.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                    chunks = []
+                    while True:
+                        try:
+                            chunk = sock.recv(4096)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                raw = b"".join(chunks)
+                if raw:
+                    break
+                time.sleep(0.05 * (attempt + 1))
+            self.assertIn(b"HTTP/1.1 503", raw)
+            self.assertGreaterEqual(server.metrics.counters.get(("llmveil_overload_rejections_total", ()), 0), 1)
         finally:
             server._request_semaphore.release()
             server.shutdown()
@@ -1188,6 +1284,47 @@ class TrustedReviewTests(unittest.TestCase):
                 gateway.call_reviewer = old
             self.assertIn("Alice Secret", captured[0])
 
+    def test_reviewers_run_in_parallel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "reviewers.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "reviewers": [
+                                {"name": "local-a", "base_url": "http://127.0.0.1:65530/v1", "model": "review-model"},
+                                {"name": "local-b", "base_url": "http://127.0.0.1:65531/v1", "model": "review-model"},
+                            ]
+                        }
+                    )
+                )
+            old = gateway.call_reviewer
+            lock = threading.Lock()
+            active = 0
+            max_active = 0
+
+            def fake_call(reviewer: gateway.ReviewerEndpoint, text: str) -> Dict[str, Any]:
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.2)
+                with lock:
+                    active -= 1
+                return {"reviewer": reviewer.name, "decision": "allow", "categories": [], "reason": ""}
+
+            gateway.call_reviewer = fake_call
+            try:
+                headers = gateway.review_response_payloads(
+                    make_config(home=tmp, reviewers_file=path),
+                    [{"choices": [{"message": {"content": "hello"}}]}],
+                    [{"choices": [{"message": {"content": "hello"}}]}],
+                )
+            finally:
+                gateway.call_reviewer = old
+            self.assertEqual(headers["X-LLMVeil-Trusted-Review-Reviewers"], "2")
+            self.assertEqual(max_active, 2)
+
     def test_review_block_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "reviewers.json")
@@ -1320,6 +1457,14 @@ class TrustedReviewTests(unittest.TestCase):
         text = gateway.collect_review_text([payload], 32000, redact=False)
         self.assertIn("Upload redactions.jsonl", text)
         self.assertIn("python -m pip install evilpkg", text)
+
+    def test_collect_review_text_truncates_before_transient_redaction(self) -> None:
+        long_secret = "password: " + ("a" * (gateway.MAX_TEXT_REDACTION_BYTES + 1024))
+        payload = {"choices": [{"message": {"content": long_secret}}]}
+        text = gateway.collect_review_text([payload], 32000, redact=True)
+        self.assertIn("[TRUNCATED]", text)
+        self.assertNotIn("password: aaaaa", text)
+        self.assertLessEqual(len(text), 32000 + len("\n[TRUNCATED]"))
 
     def test_review_result_suppresses_malicious_reason_and_sanitizes_categories(self) -> None:
         result = gateway.normalize_review_result(

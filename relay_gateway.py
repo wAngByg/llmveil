@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import concurrent.futures
 import html
 import json
 import os
@@ -56,6 +57,10 @@ SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 SAFE_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,96}$")
 SAFE_CATEGORY_RE = re.compile(r"^[a-z0-9_.:-]{1,64}$")
 PRIVATE_JSONL_LOCK = threading.Lock()
+EXTRA_REDACTIONS_CACHE_LOCK = threading.Lock()
+EXTRA_REDACTIONS_CACHE: Dict[str, Tuple[Tuple[int, int], List[str]]] = {}
+REVIEW_SETTINGS_CACHE_LOCK = threading.Lock()
+REVIEW_SETTINGS_CACHE: Dict[str, Tuple[Tuple[int, int], "ReviewSettings"]] = {}
 CONFUSABLE_TRANS = str.maketrans(
     {
         "\u0430": "a",
@@ -121,6 +126,16 @@ SENSITIVE_LABELS = [
     "secret access key",
     "secret_access_key",
     "session",
+    "access token",
+    "access_token",
+    "client secret",
+    "client_secret",
+    "private key",
+    "private_key",
+    "refresh token",
+    "refresh_token",
+    "ssh key",
+    "ssh_key",
     "street",
     "token",
     "unit",
@@ -161,6 +176,14 @@ SENSITIVE_LABELS = [
 
 SENSITIVE_LABEL_EXPR = "|".join(re.escape(label) for label in sorted(SENSITIVE_LABELS, key=len, reverse=True))
 SENSITIVE_LABEL_SET = {label.casefold() for label in SENSITIVE_LABELS}
+CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+NON_KEY_WORD_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+SCHEMA_ROOT_PATTERNS = [
+    ("tools", "function", "parameters"),
+    ("functions", "parameters"),
+    ("input_schema",),
+    ("response_format", "json_schema", "schema"),
+]
 EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w+-])")
 URL_RE = re.compile(r"(?i)\bhttps?://[^\s<>()\"']+")
 DOMAIN_RE = re.compile(
@@ -788,6 +811,48 @@ STRICT_CONTEXT_REDACTIONS = [
             r"studio|labs|foundation|institute))\b"
         ),
     ),
+    (
+        "name",
+        re.compile(
+            r"(?P<prefix>(?:我的名字是|我叫|姓名\s*(?:是|[:：])\s*|名字\s*(?:是|叫)\s*))"
+            r"(?P<value>[\u4e00-\u9fff·]{2,8})(?=$|[\s，。；、])"
+        ),
+    ),
+    (
+        "age",
+        re.compile(
+            r"(?P<prefix>(?:我的年龄是|年龄\s*(?:是|[:：])\s*|我今年))"
+            r"(?P<value>(?:[1-9]\d?|1[01]\d|120)\s*(?:岁|周岁))(?=$|[\s，。；、])"
+        ),
+    ),
+    (
+        "birthday",
+        re.compile(
+            r"(?P<prefix>(?:我的生日是|生日\s*(?:是|[:：])\s*|出生日期\s*(?:是|[:：])\s*))"
+            r"(?P<value>(?:19|20)\d{2}[-年/.](?:0?[1-9]|1[0-2])[-月/.](?:0?[1-9]|[12]\d|3[01])日?)"
+            r"(?=$|[\s，。；、])"
+        ),
+    ),
+    (
+        "address",
+        re.compile(
+            r"(?P<prefix>(?:我住在|住在|居住在|地址\s*(?:是|[:：])\s*|住址\s*(?:是|[:：])\s*|家庭地址\s*(?:是|[:：])\s*))"
+            r"(?P<value>[\u4e00-\u9fffA-Za-z0-9#._ -]{4,80}"
+            r"(?:街道|大街|大道|路|巷|弄|道|小区|社区|花园|公寓|大厦|广场|村|镇)"
+            r"(?:\d+号)?(?:\d+单元)?(?:\d+室)?)"
+            r"(?=$|[\s，。；、])"
+        ),
+    ),
+    (
+        "organization",
+        re.compile(
+            r"(?P<prefix>(?:单位\s*(?:是|[:：])\s*|公司\s*(?:是|[:：])\s*|组织\s*(?:是|[:：])\s*|"
+            r"学校\s*(?:是|[:：])\s*|我就职于|就职于|任职于|我在))"
+            r"(?P<value>[\u4e00-\u9fffA-Za-z0-9（）()·&._ -]{2,80}"
+            r"(?:有限公司|股份有限公司|公司|集团|学校|大学|学院|医院|银行|单位|中心|研究所|委员会|工作室|实验室|局|部|厅))"
+            r"(?=$|[\s，。；、])"
+        ),
+    ),
 ]
 
 PRESERVE_STRING_KEYS = {
@@ -800,6 +865,53 @@ PRESERVE_STRING_KEYS = {
     "tool_call_id",
     "type",
 }
+
+
+def sensitive_key_forms(key: str) -> set:
+    raw = str(key or "").strip()
+    if not raw:
+        return set()
+    split = CAMEL_CASE_BOUNDARY_RE.sub(" ", raw)
+    words = [part for part in NON_KEY_WORD_RE.sub(" ", split).casefold().split() if part]
+    forms = {raw.casefold()}
+    if words:
+        forms.add(" ".join(words))
+        forms.add("".join(words))
+        forms.add("_".join(words))
+    return forms
+
+
+SENSITIVE_LABEL_NORMALIZED_SET = {
+    form
+    for label in SENSITIVE_LABELS
+    for form in sensitive_key_forms(label)
+}
+
+
+def path_segments(path: Tuple[Any, ...]) -> List[str]:
+    return [str(item).casefold() for item in path if not isinstance(item, int)]
+
+
+def contains_ordered_segments(segments: List[str], pattern: Tuple[str, ...]) -> bool:
+    if not pattern:
+        return False
+    start = 0
+    for segment in pattern:
+        try:
+            start = segments.index(segment, start) + 1
+        except ValueError:
+            return False
+    return True
+
+
+def is_schema_definition_path(path: Tuple[Any, ...]) -> bool:
+    segments = path_segments(path)
+    return any(contains_ordered_segments(segments, pattern) for pattern in SCHEMA_ROOT_PATTERNS)
+
+
+def file_cache_signature(path: str) -> Tuple[int, int]:
+    stat = os.stat(path)
+    return (stat.st_mtime_ns, stat.st_size)
 
 
 class GatewayError(RuntimeError):
@@ -1033,6 +1145,8 @@ def validate_base_url(url: str) -> None:
     parsed = parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise GatewayError("upstream base URL must be an http(s) URL")
+    if parsed.username or parsed.password or parsed.params or parsed.query or parsed.fragment:
+        raise GatewayError("upstream base URL must not include userinfo, params, query, or fragment")
     if parsed.scheme == "http" and not is_loopback_url(url):
         raise GatewayError("remote base URL must use https; http is only allowed for localhost")
 
@@ -1090,8 +1204,17 @@ def load_extra_redactions(config: GatewayConfig) -> List[str]:
     path = config.extra_redactions_file
     if not path:
         return []
+    cache_path = os.path.abspath(path)
     try:
-        raw = read_text_file(path)
+        signature = file_cache_signature(cache_path)
+    except OSError as exc:
+        raise GatewayError("extra redactions file could not be read: %s" % exc, 400) from exc
+    with EXTRA_REDACTIONS_CACHE_LOCK:
+        cached = EXTRA_REDACTIONS_CACHE.get(cache_path)
+        if cached and cached[0] == signature:
+            return list(cached[1])
+    try:
+        raw = read_text_file(cache_path)
     except OSError as exc:
         raise GatewayError("extra redactions file could not be read: %s" % exc, 400) from exc
     values: List[str] = []
@@ -1099,6 +1222,8 @@ def load_extra_redactions(config: GatewayConfig) -> List[str]:
         value = line.strip()
         if value:
             values.append(value)
+    with EXTRA_REDACTIONS_CACHE_LOCK:
+        EXTRA_REDACTIONS_CACHE[cache_path] = (signature, list(values))
     return values
 
 
@@ -1555,13 +1680,7 @@ def safe_auth_prefix(value: Any) -> str:
     return prefix
 
 
-def load_review_settings(config: GatewayConfig) -> ReviewSettings:
-    if not config.reviewers_file:
-        return ReviewSettings(False, "redacted", "any-block", "block", MAX_REVIEW_TEXT_CHARS, False, [])
-    try:
-        raw = read_text_file(config.reviewers_file)
-    except OSError as exc:
-        raise GatewayError("reviewers file could not be read: %s" % exc, 400) from exc
+def parse_review_settings(raw: str) -> ReviewSettings:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -1630,6 +1749,28 @@ def load_review_settings(config: GatewayConfig) -> ReviewSettings:
             )
         )
     return ReviewSettings(enabled and bool(reviewers), payload, aggregation, failure_policy, max_text_chars, allow_remote, reviewers)
+
+
+def load_review_settings(config: GatewayConfig) -> ReviewSettings:
+    if not config.reviewers_file:
+        return ReviewSettings(False, "redacted", "any-block", "block", MAX_REVIEW_TEXT_CHARS, False, [])
+    cache_path = os.path.abspath(config.reviewers_file)
+    try:
+        signature = file_cache_signature(cache_path)
+    except OSError as exc:
+        raise GatewayError("reviewers file could not be read: %s" % exc, 400) from exc
+    with REVIEW_SETTINGS_CACHE_LOCK:
+        cached = REVIEW_SETTINGS_CACHE.get(cache_path)
+        if cached and cached[0] == signature:
+            return cached[1]
+    try:
+        raw = read_text_file(cache_path)
+    except OSError as exc:
+        raise GatewayError("reviewers file could not be read: %s" % exc, 400) from exc
+    settings = parse_review_settings(raw)
+    with REVIEW_SETTINGS_CACHE_LOCK:
+        REVIEW_SETTINGS_CACHE[cache_path] = (signature, settings)
+    return settings
 
 
 def redact_text(
@@ -1768,7 +1909,10 @@ def redact_payload(
     parent: Optional[Dict[str, Any]] = None,
     redaction_mode: str = "balanced",
     redact_wallet_keys: bool = False,
+    path: Tuple[Any, ...] = (),
 ) -> Any:
+    if is_schema_definition_path(path):
+        return value
     sensitive_key = is_sensitive_key(key, parent, value)
     if sensitive_key:
         if isinstance(value, (dict, list)):
@@ -1795,8 +1939,9 @@ def redact_payload(
                 extra_values,
                 redaction_mode=redaction_mode,
                 redact_wallet_keys=redact_wallet_keys,
+                path=path + (index,),
             )
-            for item in value
+            for index, item in enumerate(value)
         ]
     if isinstance(value, dict):
         redacted_dict: Dict[Any, Any] = {}
@@ -1815,13 +1960,16 @@ def redact_payload(
                 value,
                 redaction_mode,
                 redact_wallet_keys,
+                path + (k,),
             )
         return redacted_dict
     return value
 
 
 def is_sensitive_key(key: str, parent: Optional[Dict[str, Any]], value: Any = None) -> bool:
-    return bool(key) and key.casefold() in SENSITIVE_LABEL_SET and not should_preserve_string(key, parent, value)
+    if not key or should_preserve_string(key, parent, value):
+        return False
+    return bool(sensitive_key_forms(key) & SENSITIVE_LABEL_NORMALIZED_SET)
 
 
 def should_preserve_string(key: str, parent: Optional[Dict[str, Any]], value: Any = None) -> bool:
@@ -2315,6 +2463,34 @@ def transient_strict_redact_text(text: str, redact_wallet_keys: bool = False) ->
     return redact_text(text, mapping, kinds, redaction_mode="strict", redact_wallet_keys=redact_wallet_keys)
 
 
+def trim_text_for_review(text: str, max_chars: int) -> str:
+    trimmed = text[:max_chars]
+    while len(trimmed.encode("utf-8", "ignore")) > MAX_TEXT_REDACTION_BYTES:
+        trimmed = trimmed[: max(1, len(trimmed) // 2)]
+    return trimmed
+
+
+def limit_review_texts(texts: List[str], max_chars: int) -> Tuple[List[str], bool]:
+    remaining = max(0, max_chars)
+    limited: List[str] = []
+    truncated = False
+    for item in texts:
+        if not item:
+            continue
+        separator_cost = 2 if limited else 0
+        if remaining <= separator_cost:
+            truncated = True
+            break
+        remaining -= separator_cost
+        if len(item) > remaining:
+            limited.append(trim_text_for_review(item, remaining))
+            truncated = True
+            break
+        limited.append(trim_text_for_review(item, remaining))
+        remaining -= len(item)
+    return limited, truncated
+
+
 def collect_review_text(
     payloads: List[Dict[str, Any]],
     max_chars: int,
@@ -2324,11 +2500,14 @@ def collect_review_text(
     texts: List[str] = []
     for payload in payloads:
         collect_response_text_values(payload, texts)
+    texts, truncated = limit_review_texts(texts, max_chars)
     if redact:
         texts = [transient_strict_redact_text(item, redact_wallet_keys=redact_wallet_keys) for item in texts]
     text = "\n\n".join(item for item in texts if item)
     if len(text) > max_chars:
         return text[:max_chars] + "\n[TRUNCATED]"
+    if truncated:
+        return text + "\n[TRUNCATED]"
     return text
 
 
@@ -2409,21 +2588,53 @@ def review_response_payloads(
     )
     if not text.strip():
         return trusted_review_headers(request_id, "allow", [])
-    results: List[Dict[str, Any]] = []
     deadline = time.monotonic() + MAX_REVIEW_TOTAL_TIMEOUT
-    for reviewer in settings.reviewers:
-        try:
+    results: List[Optional[Dict[str, Any]]] = [None] * len(settings.reviewers)
+
+    def run_reviewer(reviewer: ReviewerEndpoint) -> Dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("trusted review total timeout exceeded")
+        call_target = reviewer if reviewer.timeout <= remaining else replace(reviewer, timeout=max(1, int(remaining)))
+        return safe_review_result(reviewer.name, call_reviewer(call_target, text))
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(settings.reviewers)))
+    future_to_review: Dict[concurrent.futures.Future, Tuple[int, ReviewerEndpoint]] = {}
+    pending: set = set()
+    try:
+        for index, reviewer in enumerate(settings.reviewers):
+            future = executor.submit(run_reviewer, reviewer)
+            future_to_review[future] = (index, reviewer)
+            pending.add(future)
+        while pending:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("trusted review total timeout exceeded")
-            call_target = reviewer if reviewer.timeout <= remaining else replace(reviewer, timeout=max(1, int(remaining)))
-            results.append(safe_review_result(reviewer.name, call_reviewer(call_target, text)))
-        except Exception as exc:
-            results.append(review_failure_result(settings, reviewer, exc))
-    decision, should_block = aggregate_review_results(settings, results)
+                break
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=remaining,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for future in done:
+                index, reviewer = future_to_review[future]
+                try:
+                    results[index] = future.result()
+                except Exception as exc:
+                    results[index] = review_failure_result(settings, reviewer, exc)
+    finally:
+        for future in pending:
+            future.cancel()
+            index, reviewer = future_to_review[future]
+            if results[index] is None:
+                results[index] = review_failure_result(settings, reviewer, TimeoutError("trusted review total timeout exceeded"))
+        executor.shutdown(wait=False, cancel_futures=True)
+    final_results = [item for item in results if item is not None]
+    decision, should_block = aggregate_review_results(settings, final_results)
     if should_block:
-        raise TrustedReviewError(decision, results)
-    return trusted_review_headers(request_id, decision, results)
+        raise TrustedReviewError(decision, final_results)
+    return trusted_review_headers(request_id, decision, final_results)
 
 
 def output_policy_headers(findings: List[Dict[str, str]]) -> Dict[str, str]:

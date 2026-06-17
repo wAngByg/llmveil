@@ -467,13 +467,13 @@ Valid decisions are `allow`, `warn`, and `block`. `categories` must be a list of
 
 Without trusted reviewers, overhead is local JSON processing, redaction, output scanning, placeholder restoration, and optional simulated streaming. For normal text-chat payloads this should usually be small compared with the upstream model latency.
 
-With trusted reviewers enabled, the response path waits for the upstream relay first, then reviewer calls. Current reviewer calls are sequential and full-response based, so added latency is roughly:
+With trusted reviewers enabled, the response path waits for the upstream relay first, then reviewer calls. Reviewer calls run in parallel and are full-response based, so added latency is roughly:
 
 ```text
-local processing + upstream latency + sum(reviewer endpoint latency)
+local processing + upstream latency + max(reviewer endpoint latency)
 ```
 
-The implementation caps the upstream response body at `LLMVEIL_MAX_UPSTREAM_RESPONSE_BYTES`, caps reviewers at four, caps each reviewer timeout at 60 seconds, and applies a 120-second total reviewer budget. Worst-case latency can still be high when multiple reviewers are slow, and simulated streaming cannot emit the first local event until the upstream response and configured review steps finish.
+The implementation caps the upstream response body at `LLMVEIL_MAX_UPSTREAM_RESPONSE_BYTES`, caps reviewers at four, caps each reviewer timeout at 60 seconds, and applies a 120-second total reviewer budget. Worst-case latency can still be high when reviewer endpoints are slow, and simulated streaming cannot emit the first local event until the upstream response and configured review steps finish.
 
 Practical tuning:
 
