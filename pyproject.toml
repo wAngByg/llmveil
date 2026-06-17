@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmveil"
+version = "0.1.20260617.1"
+description = "Local best-effort redaction and output-policy gateway for compatible text-chat relay APIs"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [{ name = "wAngByg", email = "281221101+wAngByg@users.noreply.github.com" }]
+keywords = ["privacy", "redaction", "relay", "gateway", "output-policy", "review", "openai-compatible", "anthropic-compatible"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet :: Proxy Servers",
+  "Topic :: Security",
+  "Typing :: Typed",
+]
+
+[project.scripts]
+llmveil = "relay_gateway:main"
+
+[tool.setuptools]
+py-modules = ["relay_gateway", "llmveil"]

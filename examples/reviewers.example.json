@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "payload": "redacted",
+  "aggregation": "any-block",
+  "failure_policy": "block",
+  "allow_remote": false,
+  "max_text_chars": 32000,
+  "reviewers": [
+    {
+      "name": "trusted-local-a",
+      "base_url": "http://127.0.0.1:9001/v1",
+      "model": "review-model-a"
+    }
+  ]
+}
