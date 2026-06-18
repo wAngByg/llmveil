@@ -473,7 +473,7 @@ With trusted reviewers enabled, the response path waits for the upstream relay f
 local processing + upstream latency + max(reviewer endpoint latency)
 ```
 
-The implementation caps the upstream response body at `LLMVEIL_MAX_UPSTREAM_RESPONSE_BYTES`, caps reviewers at four, caps each reviewer timeout at 60 seconds, and applies a 120-second total reviewer budget. Worst-case latency can still be high when reviewer endpoints are slow, and simulated streaming cannot emit the first local event until the upstream response and configured review steps finish.
+The implementation caps the upstream response body at `LLMVEIL_MAX_UPSTREAM_RESPONSE_BYTES`, caps reviewers at four, caps each reviewer timeout at 60 seconds, and applies a 120-second total reviewer budget. Worst-case latency can still be high when reviewer endpoints are slow, and simulated streaming cannot emit the first local event until the upstream response and configured review steps finish. If the total reviewer budget expires after a reviewer HTTP request has already started, LLMVeil discards that reviewer result for the local decision, but the underlying socket may remain occupied until that reviewer request returns or reaches its own timeout.
 
 Practical tuning:
 

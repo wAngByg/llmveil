@@ -196,6 +196,8 @@ class RedactionTests(unittest.TestCase):
         mapping = {}
         kinds = {}
         body = {
+            "APIKEY": "api-key-value",
+            "SSHKEY": "ssh-key-value-uppercase",
             "accessToken": "access-token-value",
             "refreshToken": "refresh-token-value",
             "clientSecret": "client-secret-value",
@@ -231,10 +233,11 @@ class RedactionTests(unittest.TestCase):
     def test_strict_contextual_redaction_supports_chinese_sentences(self) -> None:
         mapping = {}
         kinds = {}
-        text = "我的名字是张三，住在北京市朝阳路18号，单位是示例科技有限公司。"
+        text = "我的名字是张三，住在北京市朝阳路18号，单位是示例科技有限公司。我住在北京市朝阳区。"
         out = gateway.redact_text(text, mapping, kinds, redaction_mode="strict")
         self.assertNotIn("张三", out)
         self.assertNotIn("北京市朝阳路18号", out)
+        self.assertNotIn("北京市朝阳区", out)
         self.assertNotIn("示例科技有限公司", out)
         self.assertGreaterEqual(len(mapping), 3)
 
@@ -529,6 +532,8 @@ class ProtocolTests(unittest.TestCase):
         thread.start()
         try:
             raw = b""
+            # The server thread can accept just after the client opens the socket on busy CI hosts.
+            # Retry empty reads briefly; the assertion still requires an actual 503 response.
             for attempt in range(3):
                 with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
                     sock.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
@@ -1102,6 +1107,27 @@ class TrustedReviewTests(unittest.TestCase):
             with self.assertRaises(gateway.GatewayError):
                 gateway.load_review_settings(make_config(home=tmp, reviewers_file=path))
 
+    def test_review_settings_cache_returns_fresh_reviewer_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "reviewers.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "reviewers": [
+                                {"name": "local-a", "base_url": "http://127.0.0.1:65530/v1", "model": "review-model"}
+                            ]
+                        }
+                    )
+                )
+            cfg = make_config(home=tmp, reviewers_file=path)
+            first = gateway.load_review_settings(cfg)
+            first.reviewers.clear()
+            second = gateway.load_review_settings(cfg)
+            self.assertTrue(second.enabled)
+            self.assertEqual(len(second.reviewers), 1)
+            self.assertEqual(second.reviewers[0].name, "local-a")
+
     def test_call_reviewer_openai_compatible_endpoint(self) -> None:
         seen = {}
 
@@ -1465,6 +1491,20 @@ class TrustedReviewTests(unittest.TestCase):
         self.assertIn("[TRUNCATED]", text)
         self.assertNotIn("password: aaaaa", text)
         self.assertLessEqual(len(text), 32000 + len("\n[TRUNCATED]"))
+
+    def test_collect_review_text_exact_budget_has_no_truncation_marker(self) -> None:
+        text = gateway.collect_review_text(["a" * 32000], 32000, redact=False)
+        self.assertEqual(text, "a" * 32000)
+        self.assertNotIn("[TRUNCATED]", text)
+
+    def test_collect_review_text_exact_budget_with_separator_has_no_truncation_marker(self) -> None:
+        text = gateway.collect_review_text(["a" * 10, "b" * 8], 20, redact=False)
+        self.assertEqual(text, "%s\n\n%s" % ("a" * 10, "b" * 8))
+        self.assertNotIn("[TRUNCATED]", text)
+
+    def test_collect_review_text_marks_truncation_only_when_content_is_dropped(self) -> None:
+        text = gateway.collect_review_text(["a" * 10, "b" * 8, "c"], 20, redact=False)
+        self.assertEqual(text, "%s\n\n%s\n[TRUNCATED]" % ("a" * 10, "b" * 8))
 
     def test_review_result_suppresses_malicious_reason_and_sanitizes_categories(self) -> None:
         result = gateway.normalize_review_result(

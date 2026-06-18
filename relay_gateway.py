@@ -761,7 +761,7 @@ DATE_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}[-年/.](?:0?[1-9]|1[0-2])[-月/.](?
 COMPACT_DATE_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])(?!\d)")
 CN_STREET_RE = re.compile(
     r"[\u4e00-\u9fffA-Za-z0-9]{2,40}"
-    r"(?:街道|大街|大道|路|巷|弄|道|小区|社区|花园|公寓|大厦|广场|村|镇)"
+    r"(?:街道|大街|大道|路|巷|弄|道|小区|社区|花园|公寓|大厦|广场|村|镇|区|市|县|旗)"
     r"(?:\d+号)?(?:\d+单元)?(?:\d+室)?"
 )
 CN_ORG_RE = re.compile(
@@ -838,7 +838,7 @@ STRICT_CONTEXT_REDACTIONS = [
         re.compile(
             r"(?P<prefix>(?:我住在|住在|居住在|地址\s*(?:是|[:：])\s*|住址\s*(?:是|[:：])\s*|家庭地址\s*(?:是|[:：])\s*))"
             r"(?P<value>[\u4e00-\u9fffA-Za-z0-9#._ -]{4,80}"
-            r"(?:街道|大街|大道|路|巷|弄|道|小区|社区|花园|公寓|大厦|广场|村|镇)"
+            r"(?:街道|大街|大道|路|巷|弄|道|小区|社区|花园|公寓|大厦|广场|村|镇|区|市|县|旗)"
             r"(?:\d+号)?(?:\d+单元)?(?:\d+室)?)"
             r"(?=$|[\s，。；、])"
         ),
@@ -912,6 +912,10 @@ def is_schema_definition_path(path: Tuple[Any, ...]) -> bool:
 def file_cache_signature(path: str) -> Tuple[int, int]:
     stat = os.stat(path)
     return (stat.st_mtime_ns, stat.st_size)
+
+
+def copy_review_settings(settings: "ReviewSettings") -> "ReviewSettings":
+    return replace(settings, reviewers=list(settings.reviewers))
 
 
 class GatewayError(RuntimeError):
@@ -1762,7 +1766,7 @@ def load_review_settings(config: GatewayConfig) -> ReviewSettings:
     with REVIEW_SETTINGS_CACHE_LOCK:
         cached = REVIEW_SETTINGS_CACHE.get(cache_path)
         if cached and cached[0] == signature:
-            return cached[1]
+            return copy_review_settings(cached[1])
     try:
         raw = read_text_file(cache_path)
     except OSError as exc:
@@ -1770,7 +1774,7 @@ def load_review_settings(config: GatewayConfig) -> ReviewSettings:
     settings = parse_review_settings(raw)
     with REVIEW_SETTINGS_CACHE_LOCK:
         REVIEW_SETTINGS_CACHE[cache_path] = (signature, settings)
-    return settings
+    return copy_review_settings(settings)
 
 
 def redact_text(
@@ -2463,31 +2467,34 @@ def transient_strict_redact_text(text: str, redact_wallet_keys: bool = False) ->
     return redact_text(text, mapping, kinds, redaction_mode="strict", redact_wallet_keys=redact_wallet_keys)
 
 
-def trim_text_for_review(text: str, max_chars: int) -> str:
+def trim_text_for_review(text: str, max_chars: int) -> Tuple[str, bool]:
     trimmed = text[:max_chars]
+    truncated = len(trimmed) < len(text)
     while len(trimmed.encode("utf-8", "ignore")) > MAX_TEXT_REDACTION_BYTES:
         trimmed = trimmed[: max(1, len(trimmed) // 2)]
-    return trimmed
+        truncated = True
+    return trimmed, truncated
 
 
 def limit_review_texts(texts: List[str], max_chars: int) -> Tuple[List[str], bool]:
-    remaining = max(0, max_chars)
     limited: List[str] = []
+    used_chars = 0
     truncated = False
     for item in texts:
         if not item:
             continue
-        separator_cost = 2 if limited else 0
-        if remaining <= separator_cost:
+        separator_chars = 2 if limited else 0
+        available = max_chars - used_chars - separator_chars
+        if available <= 0:
             truncated = True
             break
-        remaining -= separator_cost
-        if len(item) > remaining:
-            limited.append(trim_text_for_review(item, remaining))
+        trimmed, item_truncated = trim_text_for_review(item, available)
+        if trimmed:
+            limited.append(trimmed)
+            used_chars += separator_chars + len(trimmed)
+        if item_truncated:
             truncated = True
             break
-        limited.append(trim_text_for_review(item, remaining))
-        remaining -= len(item)
     return limited, truncated
 
 
