@@ -8,6 +8,7 @@ import base64
 import binascii
 import concurrent.futures
 import html
+import ipaddress
 import json
 import os
 import quopri
@@ -54,6 +55,7 @@ MAX_REVIEW_TOTAL_TIMEOUT = 120
 MAX_REVIEW_RESPONSE_BYTES = 256 * 1024
 MAX_DECODED_CANDIDATE_BYTES = 128 * 1024
 SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+SAFE_PROTOCOL_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,200}$")
 SAFE_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,96}$")
 SAFE_CATEGORY_RE = re.compile(r"^[a-z0-9_.:-]{1,64}$")
 PRIVATE_JSONL_LOCK = threading.Lock()
@@ -178,12 +180,6 @@ SENSITIVE_LABEL_EXPR = "|".join(re.escape(label) for label in sorted(SENSITIVE_L
 SENSITIVE_LABEL_SET = {label.casefold() for label in SENSITIVE_LABELS}
 CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 NON_KEY_WORD_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
-SCHEMA_ROOT_PATTERNS = [
-    ("tools", "function", "parameters"),
-    ("functions", "parameters"),
-    ("input_schema",),
-    ("response_format", "json_schema", "schema"),
-]
 EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w+-])")
 URL_RE = re.compile(r"(?i)\bhttps?://[^\s<>()\"']+")
 DOMAIN_RE = re.compile(
@@ -855,18 +851,6 @@ STRICT_CONTEXT_REDACTIONS = [
     ),
 ]
 
-PRESERVE_STRING_KEYS = {
-    "id",
-    "model",
-    "object",
-    "role",
-    "stop_reason",
-    "stop_sequence",
-    "tool_call_id",
-    "type",
-}
-
-
 def sensitive_key_forms(key: str) -> set:
     raw = str(key or "").strip()
     if not raw:
@@ -888,25 +872,28 @@ SENSITIVE_LABEL_NORMALIZED_SET = {
 }
 
 
-def path_segments(path: Tuple[Any, ...]) -> List[str]:
-    return [str(item).casefold() for item in path if not isinstance(item, int)]
-
-
-def contains_ordered_segments(segments: List[str], pattern: Tuple[str, ...]) -> bool:
-    if not pattern:
-        return False
-    start = 0
-    for segment in pattern:
-        try:
-            start = segments.index(segment, start) + 1
-        except ValueError:
-            return False
-    return True
+def path_key(value: Any) -> str:
+    return str(value).casefold() if isinstance(value, str) else ""
 
 
 def is_schema_definition_path(path: Tuple[Any, ...]) -> bool:
-    segments = path_segments(path)
-    return any(contains_ordered_segments(segments, pattern) for pattern in SCHEMA_ROOT_PATTERNS)
+    if len(path) >= 4 and path_key(path[0]) == "tools" and isinstance(path[1], int):
+        if path_key(path[2]) == "function" and path_key(path[3]) == "parameters":
+            return True
+    if len(path) >= 3 and path_key(path[0]) == "tools" and isinstance(path[1], int):
+        if path_key(path[2]) == "input_schema":
+            return True
+    if len(path) >= 3 and path_key(path[0]) == "functions" and isinstance(path[1], int):
+        if path_key(path[2]) == "parameters":
+            return True
+    if len(path) >= 3:
+        if (
+            path_key(path[0]) == "response_format"
+            and path_key(path[1]) == "json_schema"
+            and path_key(path[2]) == "schema"
+        ):
+            return True
+    return False
 
 
 def file_cache_signature(path: str) -> Tuple[int, int]:
@@ -915,7 +902,7 @@ def file_cache_signature(path: str) -> Tuple[int, int]:
 
 
 def copy_review_settings(settings: "ReviewSettings") -> "ReviewSettings":
-    return replace(settings, reviewers=list(settings.reviewers))
+    return replace(settings, reviewers=[replace(reviewer) for reviewer in settings.reviewers])
 
 
 class GatewayError(RuntimeError):
@@ -996,6 +983,7 @@ class GatewayConfig:
     @classmethod
     def from_env(cls, args: argparse.Namespace) -> "GatewayConfig":
         home = expand_path(args.home or env_value("LLMVEIL_HOME", DEFAULT_HOME))
+        host = args.host or env_value("LLMVEIL_HOST", DEFAULT_HOST)
         upstream_base_url = (
             args.upstream_base_url or env_value("LLMVEIL_UPSTREAM_BASE_URL", "")
         ).strip()
@@ -1023,13 +1011,15 @@ class GatewayConfig:
         if not upstream_base_url:
             raise GatewayError("upstream base URL is required")
         validate_base_url(upstream_base_url)
+        local_api_key = args.local_api_key or env_secret("LLMVEIL_LOCAL_API_KEY", "LLMVEIL_LOCAL_API_KEY_ENV")
+        validate_local_bind(host, local_api_key)
         return cls(
-            host=args.host or env_value("LLMVEIL_HOST", DEFAULT_HOST),
+            host=host,
             port=bounded_int(args.port if args.port is not None else env_value("LLMVEIL_PORT", ""), DEFAULT_PORT, 1, 65535, "LLMVEIL_PORT"),
             upstream_base_url=upstream_base_url.rstrip("/"),
             upstream_protocol=upstream_protocol,
             upstream_api_key=args.upstream_api_key or env_secret("LLMVEIL_UPSTREAM_API_KEY", "LLMVEIL_UPSTREAM_API_KEY_ENV"),
-            local_api_key=args.local_api_key or env_secret("LLMVEIL_LOCAL_API_KEY", "LLMVEIL_LOCAL_API_KEY_ENV"),
+            local_api_key=local_api_key,
             home=home,
             request_timeout=env_int("LLMVEIL_TIMEOUT", 120, 1, 600),
             max_body_bytes=env_int("LLMVEIL_MAX_BODY_BYTES", 8 * 1024 * 1024, 1024, 64 * 1024 * 1024),
@@ -1146,13 +1136,27 @@ def env_secret(direct_name: str, env_pointer_name: str, default: str = "") -> st
 
 
 def validate_base_url(url: str) -> None:
+    if not url or any(ord(char) <= 32 or ord(char) == 127 for char in url) or "\\" in url:
+        raise GatewayError("upstream base URL contains unsafe characters")
     parsed = parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise GatewayError("upstream base URL must be an http(s) URL")
+    try:
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise GatewayError("upstream base URL has an invalid host or port") from exc
+    if not hostname or any(ord(char) <= 32 or ord(char) == 127 for char in hostname):
+        raise GatewayError("upstream base URL must include a valid hostname")
     if parsed.username or parsed.password or parsed.params or parsed.query or parsed.fragment:
         raise GatewayError("upstream base URL must not include userinfo, params, query, or fragment")
     if parsed.scheme == "http" and not is_loopback_url(url):
         raise GatewayError("remote base URL must use https; http is only allowed for localhost")
+
+
+def validate_local_bind(host: str, local_api_key: str) -> None:
+    if not is_loopback_host(host) and not local_api_key:
+        raise GatewayError("LLMVEIL_LOCAL_API_KEY or LLMVEIL_LOCAL_API_KEY_ENV is required when binding outside localhost")
 
 
 def private_home(config: GatewayConfig) -> str:
@@ -1280,6 +1284,14 @@ def parse_env_file(path: str) -> Dict[str, str]:
         key, value = stripped.split("=", 1)
         key = key.strip()
         value = value.strip()
+        if value.startswith('"') and value.endswith('"'):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise GatewayError("config file line %d has an invalid quoted value" % lineno) from exc
+            if not isinstance(decoded, str):
+                raise GatewayError("config file line %d has an invalid quoted value" % lineno)
+            value = decoded
         if not re.fullmatch(r"LLMVEIL_[A-Z0-9_]{1,80}", key):
             raise GatewayError("config file line %d has an unsupported key" % lineno)
         if key not in allowed_keys:
@@ -1359,7 +1371,11 @@ DEPENDENCY_UNTRUSTED_SOURCE_RE = re.compile(
 )
 DEPENDENCY_RUNNER_RE = re.compile(r"(?is)\b(npx|pnpm\s+dlx|bunx|uvx|pipx)\b")
 DEPENDENCY_SYSTEM_INSTALL_RE = re.compile(r"(?is)\b(apt-get|apt|brew|winget|choco)\s+(install|add)\b")
-DEPENDENCY_SIDE_EFFECT_FLAG_RE = re.compile(r"(?is)\b--(?:collect|upload|send|post|eval|exec|script|shell)\b")
+DEPENDENCY_SIDE_EFFECT_FLAG_RE = re.compile(
+    r"(?is)(?:^|\s)--(?:collect|upload|send|post|eval|exec|script|shell|"
+    r"break-system-packages|force-reinstall|ignore-installed|no-deps|"
+    r"target|prefix|root|global-option|install-option)\b"
+)
 
 
 def split_dependency_args(raw: str) -> List[str]:
@@ -1418,27 +1434,6 @@ def dependency_intent_texts_from_request(body: Dict[str, Any]) -> List[str]:
                 text = content_to_text(item.get("content"))
                 if text:
                     texts.append(text)
-    prompt = body.get("prompt")
-    if isinstance(prompt, str):
-        texts.append(prompt)
-    input_value = body.get("input")
-    if isinstance(input_value, str):
-        texts.append(input_value)
-    elif isinstance(input_value, list):
-        for item in input_value:
-            if isinstance(item, str):
-                texts.append(item)
-            elif isinstance(item, dict):
-                text = content_to_text(item.get("content"))
-                if text:
-                    texts.append(text)
-    content = body.get("content")
-    if isinstance(content, str):
-        texts.append(content)
-    elif isinstance(content, list):
-        text = content_to_text(content)
-        if text:
-            texts.append(text)
     return texts
 
 
@@ -1482,6 +1477,8 @@ def package_install_allowed_by_context(text: str, allowed_dependencies: Optional
 
 def safe_request_id(value: str) -> str:
     cleaned = str(value or "").strip()
+    if contains_sensitive_literal(cleaned):
+        return ""
     return cleaned if SAFE_TOKEN_RE.fullmatch(cleaned) else ""
 
 
@@ -1576,6 +1573,13 @@ class GatewayMetrics:
         return "\n".join(lines) + "\n"
 
 
+def format_env_value(value: str) -> str:
+    text = str(value)
+    if text != text.strip() or any(char in text for char in ['"', "#"]):
+        return json.dumps(text, ensure_ascii=False)
+    return text
+
+
 def write_env_file(path: str, values: Dict[str, str]) -> None:
     parent = os.path.dirname(path)
     if parent:
@@ -1590,7 +1594,7 @@ def write_env_file(path: str, values: Dict[str, str]) -> None:
     for key in sorted(values):
         value = values[key]
         if value:
-            lines.append("%s=%s" % (key, value))
+            lines.append("%s=%s" % (key, format_env_value(value)))
     data = ("\n".join(lines) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -1603,10 +1607,19 @@ def write_env_file(path: str, values: Dict[str, str]) -> None:
         pass
 
 
+def is_loopback_host(host: str) -> bool:
+    cleaned = str(host or "").strip().strip("[]").casefold()
+    if cleaned == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
 def is_loopback_url(url: str) -> bool:
     parsed = parse.urlparse(url)
-    host = (parsed.hostname or "").casefold()
-    return host in {"localhost", "127.0.0.1", "::1"}
+    return is_loopback_host(parsed.hostname or "")
 
 
 def json_bool(data: Dict[str, Any], key: str, default: bool) -> bool:
@@ -1727,23 +1740,25 @@ def parse_review_settings(raw: str) -> ReviewSettings:
         if protocol != "openai":
             raise GatewayError("reviewer %d protocol must be openai" % index)
         name = str(item.get("name") or "reviewer-%d" % (index + 1)).strip()
+        safe_name = "" if contains_sensitive_literal(name) else safe_token(name, "")
+        safe_name = safe_name or "reviewer-%d" % (index + 1)
         base_url = str(item.get("base_url") or "").strip().rstrip("/")
         model = str(item.get("model") or "").strip()
         if not base_url or not model:
-            raise GatewayError("reviewer %s must set base_url and model" % name)
+            raise GatewayError("reviewer %s must set base_url and model" % safe_name)
         validate_base_url(base_url)
         remote = not is_loopback_url(base_url)
         parsed_base = parse.urlparse(base_url)
         if remote and not allow_remote:
-            raise GatewayError("reviewer %s is not localhost; set allow_remote true only for trusted endpoints" % name)
+            raise GatewayError("reviewer %s is not localhost; set allow_remote true only for trusted endpoints" % safe_name)
         if remote and parsed_base.scheme != "https":
-            raise GatewayError("remote reviewer %s must use https" % name)
+            raise GatewayError("remote reviewer %s must use https" % safe_name)
         if remote and payload == "restored" and not allow_private_payload:
-            raise GatewayError("remote restored reviewer %s requires allow_private_payload true" % name)
-        timeout = bounded_int(item.get("timeout"), 30, 1, MAX_REVIEWER_TIMEOUT, "reviewer %s timeout" % name)
+            raise GatewayError("remote restored reviewer %s requires allow_private_payload true" % safe_name)
+        timeout = bounded_int(item.get("timeout"), 30, 1, MAX_REVIEWER_TIMEOUT, "reviewer %s timeout" % safe_name)
         reviewers.append(
             ReviewerEndpoint(
-                name=safe_token(name, "reviewer-%d" % (index + 1)),
+                name=safe_name,
                 base_url=base_url,
                 model=model,
                 api_key_env=str(item.get("api_key_env") or "").strip(),
@@ -1915,9 +1930,8 @@ def redact_payload(
     redact_wallet_keys: bool = False,
     path: Tuple[Any, ...] = (),
 ) -> Any:
-    if is_schema_definition_path(path):
-        return value
-    sensitive_key = is_sensitive_key(key, parent, value)
+    schema_context = is_schema_definition_path(path)
+    sensitive_key = is_sensitive_key(key, parent, value, path)
     if sensitive_key:
         if isinstance(value, (dict, list)):
             original = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -1931,7 +1945,7 @@ def redact_payload(
             return placeholder
         return value
     if isinstance(value, str):
-        if should_preserve_string(key, parent, value):
+        if should_preserve_string(key, parent, value, path):
             return value
         return redact_text(value, mapping, kinds, extra_values, redaction_mode, redact_wallet_keys)
     if isinstance(value, list):
@@ -1952,7 +1966,7 @@ def redact_payload(
         for k, v in value.items():
             redacted_key = (
                 redact_text(k, mapping, kinds, extra_values, redaction_mode, redact_wallet_keys)
-                if isinstance(k, str)
+                if isinstance(k, str) and not schema_context
                 else k
             )
             redacted_dict[redacted_key] = redact_payload(
@@ -1970,26 +1984,79 @@ def redact_payload(
     return value
 
 
-def is_sensitive_key(key: str, parent: Optional[Dict[str, Any]], value: Any = None) -> bool:
-    if not key or should_preserve_string(key, parent, value):
+def is_sensitive_key(key: str, parent: Optional[Dict[str, Any]], value: Any = None, path: Tuple[Any, ...] = ()) -> bool:
+    if not key or is_schema_definition_path(path) or should_preserve_string(key, parent, value, path):
         return False
     return bool(sensitive_key_forms(key) & SENSITIVE_LABEL_NORMALIZED_SET)
 
 
-def should_preserve_string(key: str, parent: Optional[Dict[str, Any]], value: Any = None) -> bool:
-    if key in PRESERVE_STRING_KEYS:
-        return True
-    if key != "name" or not parent:
+def contains_sensitive_literal(value: Any) -> bool:
+    raw = str(value or "")
+    return bool(
+        TOKEN_RE.search(raw)
+        or AWS_ACCESS_KEY_RE.search(raw)
+        or HEX_PRIVATE_KEY_RE.search(raw)
+        or EMAIL_RE.search(raw)
+        or PHONE_RE.search(raw)
+        or CN_ID_RE.search(raw)
+    )
+
+
+def safe_protocol_value(value: Any) -> bool:
+    raw = str(value or "")
+    return bool(raw and SAFE_PROTOCOL_VALUE_RE.fullmatch(raw) and not contains_sensitive_literal(raw))
+
+
+def path_is(path: Tuple[Any, ...], *expected: Any) -> bool:
+    if len(path) != len(expected):
         return False
-    parent_type = str(parent.get("type") or "")
-    if parent_type in {"function", "tool_use", "tool_result"}:
-        return True
-    if value is not None and not SAFE_TOKEN_RE.fullmatch(str(value)):
+    for actual, wanted in zip(path, expected):
+        if wanted is int:
+            if not isinstance(actual, int):
+                return False
+        elif path_key(actual) != path_key(wanted):
+            return False
+    return True
+
+
+def should_preserve_schema_string(key: str, value: Any) -> bool:
+    normalized = path_key(key)
+    if normalized in {"type", "format", "$schema", "$id", "$ref", "contentencoding", "contentmediatype"}:
+        return safe_protocol_value(value)
+    return False
+
+
+def should_preserve_string(key: str, parent: Optional[Dict[str, Any]], value: Any = None, path: Tuple[Any, ...] = ()) -> bool:
+    if is_schema_definition_path(path):
+        return should_preserve_schema_string(key, value)
+    if not safe_protocol_value(value):
         return False
-    if "input_schema" in parent:
-        return parent_type in {"tool", "function"} or "description" in parent
-    if "parameters" in parent:
-        return parent_type == "function" or "description" in parent or set(parent.keys()).issubset({"name", "parameters"})
+    if path_is(path, "model"):
+        return True
+    if path_is(path, "response_format", "type"):
+        return True
+    if path_is(path, "response_format", "json_schema", "name"):
+        return True
+    if path_is(path, "tools", int, "type") or path_is(path, "tools", int, "name"):
+        return True
+    if path_is(path, "tools", int, "function", "name"):
+        return True
+    if path_is(path, "functions", int, "name"):
+        return True
+    if path_is(path, "tool_choice", "function", "name"):
+        return True
+    if path_is(path, "messages", int, "role") or path_is(path, "messages", int, "name"):
+        return True
+    if path_is(path, "messages", int, "tool_call_id"):
+        return True
+    if path_is(path, "messages", int, "content", int, "type"):
+        return True
+    if path_is(path, "messages", int, "tool_calls", int, "id"):
+        return True
+    if path_is(path, "messages", int, "tool_calls", int, "type"):
+        return True
+    if path_is(path, "messages", int, "tool_calls", int, "function", "name"):
+        return True
     return False
 
 
@@ -2426,45 +2493,71 @@ def call_reviewer(reviewer: ReviewerEndpoint, text: str) -> Dict[str, Any]:
     return normalize_review_result(reviewer.name, extract_json_object(content))
 
 
-def collect_response_text_values(value: Any, out: List[str]) -> None:
+def append_review_text(out: List[str], seen: set, value: Any) -> None:
+    text = str(value or "")
+    if text and text not in seen:
+        seen.add(text)
+        out.append(text)
+
+
+def collect_response_text_values(value: Any, out: List[str], seen: Optional[set] = None) -> None:
+    if seen is None:
+        seen = set()
     if isinstance(value, dict):
-        for key in value:
-            if isinstance(key, str):
-                out.append(key)
+        handled = set()
         choices = value.get("choices")
         if isinstance(choices, list):
+            handled.add("choices")
             for choice in choices:
-                if not isinstance(choice, dict):
-                    continue
-                message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
-                text = content_to_text(message.get("content"))
-                if text:
-                    out.append(text)
+                collect_response_text_values(choice, out, seen)
+        message = value.get("message")
+        if isinstance(message, dict):
+            handled.add("message")
+            collect_response_text_values(message, out, seen)
         content = value.get("content")
         if isinstance(content, str):
-            out.append(content)
+            handled.add("content")
+            append_review_text(out, seen, content)
         elif isinstance(content, list):
+            handled.add("content")
             text = "\n".join(
                 item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
             )
             if text:
-                out.append(text)
-        for item in value.values():
+                append_review_text(out, seen, text)
+        for key in ("tool_calls", "function_call", "metadata", "error", "data"):
+            if key in value:
+                handled.add(key)
+                collect_response_text_values(value[key], out, seen)
+        for key, item in value.items():
+            if key in handled:
+                continue
             if isinstance(item, str):
-                out.append(item)
+                append_review_text(out, seen, item)
             elif isinstance(item, (dict, list)):
-                collect_response_text_values(item, out)
+                collect_response_text_values(item, out, seen)
     elif isinstance(value, list):
         for item in value:
-            collect_response_text_values(item, out)
+            collect_response_text_values(item, out, seen)
     elif isinstance(value, str):
-        out.append(value)
+        append_review_text(out, seen, value)
 
 
-def transient_strict_redact_text(text: str, redact_wallet_keys: bool = False) -> str:
+def transient_strict_redact_text(
+    text: str,
+    redact_wallet_keys: bool = False,
+    extra_values: Optional[List[str]] = None,
+) -> str:
     mapping: Dict[str, str] = {}
     kinds: Dict[str, set] = {}
-    return redact_text(text, mapping, kinds, redaction_mode="strict", redact_wallet_keys=redact_wallet_keys)
+    return redact_text(
+        text,
+        mapping,
+        kinds,
+        extra_values or [],
+        redaction_mode="strict",
+        redact_wallet_keys=redact_wallet_keys,
+    )
 
 
 def trim_text_for_review(text: str, max_chars: int) -> Tuple[str, bool]:
@@ -2477,6 +2570,7 @@ def trim_text_for_review(text: str, max_chars: int) -> Tuple[str, bool]:
 
 
 def limit_review_texts(texts: List[str], max_chars: int) -> Tuple[List[str], bool]:
+    max_chars = max(1, max_chars)
     limited: List[str] = []
     used_chars = 0
     truncated = False
@@ -2503,13 +2597,22 @@ def collect_review_text(
     max_chars: int,
     redact: bool = False,
     redact_wallet_keys: bool = False,
+    extra_redactions: Optional[List[str]] = None,
 ) -> str:
+    max_chars = max(1, max_chars)
     texts: List[str] = []
     for payload in payloads:
         collect_response_text_values(payload, texts)
     texts, truncated = limit_review_texts(texts, max_chars)
     if redact:
-        texts = [transient_strict_redact_text(item, redact_wallet_keys=redact_wallet_keys) for item in texts]
+        texts = [
+            transient_strict_redact_text(
+                item,
+                redact_wallet_keys=redact_wallet_keys,
+                extra_values=extra_redactions,
+            )
+            for item in texts
+        ]
     text = "\n\n".join(item for item in texts if item)
     if len(text) > max_chars:
         return text[:max_chars] + "\n[TRUNCATED]"
@@ -2581,17 +2684,22 @@ def review_response_payloads(
     config: GatewayConfig,
     redacted_payloads: List[Dict[str, Any]],
     restored_payloads: List[Dict[str, Any]],
+    extra_redactions: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     settings = load_review_settings(config)
     if not settings.enabled:
         return {}
     request_id = "%d-%s" % (int(time.time() * 1000), secrets.token_hex(8))
     payloads = restored_payloads if settings.payload == "restored" else redacted_payloads
+    reviewer_extra_redactions = []
+    if settings.payload == "redacted":
+        reviewer_extra_redactions = load_extra_redactions(config) + list(extra_redactions or [])
     text = collect_review_text(
         payloads,
         settings.max_text_chars,
         redact=settings.payload == "redacted",
         redact_wallet_keys=config.redact_wallet_keys,
+        extra_redactions=reviewer_extra_redactions,
     )
     if not text.strip():
         return trusted_review_headers(request_id, "allow", [])
@@ -3119,8 +3227,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "level": "info",
             "remote": self.client_address[0] if self.client_address else "",
             "request_id": getattr(self, "request_id", ""),
-            "message": fmt % args,
+            "method": safe_token(getattr(self, "command", ""), "unknown"),
+            "path": getattr(self, "request_path_label", metrics_path(self.request_path())),
         }
+        if args:
+            entry["status"] = safe_header_value(args[1] if len(args) > 1 else args[0], 16)
+        if len(args) > 2:
+            entry["size"] = safe_header_value(args[2], 32)
         eprint(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
 
     @property
@@ -3361,7 +3474,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 reverse,
                 allowed_dependencies=allowed_dependencies,
             )
-            review_headers = review_response_payloads(self.config, [response], [restored])
+            review_headers = review_response_payloads(self.config, [response], [restored], list(reverse.values()))
         else:
             upstream_body = openai_to_anthropic(redacted)
             response = upstream_post(self.config, "/v1/messages", upstream_body)
@@ -3375,7 +3488,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 restored,
                 allowed_dependencies=allowed_dependencies,
             )
-            review_headers = review_response_payloads(self.config, [response, redacted_final], [restored_upstream, restored])
+            review_headers = review_response_payloads(
+                self.config,
+                [response, redacted_final],
+                [restored_upstream, restored],
+                list(reverse.values()),
+            )
         headers = {**policy_headers, **review_headers}
         if client_stream:
             self.send_sse(openai_stream_bytes(restored, str(redacted.get("model") or "")), headers=headers)
@@ -3397,7 +3515,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 reverse,
                 allowed_dependencies=allowed_dependencies,
             )
-            review_headers = review_response_payloads(self.config, [response], [restored])
+            review_headers = review_response_payloads(self.config, [response], [restored], list(reverse.values()))
         else:
             upstream_body = anthropic_to_openai(redacted)
             response = upstream_post(self.config, "/v1/chat/completions", upstream_body)
@@ -3411,7 +3529,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 restored,
                 allowed_dependencies=allowed_dependencies,
             )
-            review_headers = review_response_payloads(self.config, [response, redacted_final], [restored_upstream, restored])
+            review_headers = review_response_payloads(
+                self.config,
+                [response, redacted_final],
+                [restored_upstream, restored],
+                list(reverse.values()),
+            )
         headers = {**policy_headers, **review_headers}
         if client_stream:
             self.send_sse(anthropic_stream_bytes(restored, str(redacted.get("model") or "")), headers=headers)

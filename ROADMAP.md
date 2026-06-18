@@ -26,7 +26,7 @@ LLMVeil is intentionally small: a local, auditable text-chat relay with best-eff
 - Add per-category severity overrides so users can choose what blocks, annotates, or passes.
 - Add optional local JSONL audit logging that records category and severity without storing raw secrets.
 - Add reviewer weighting, per-reviewer categories, and offline replay over feedback records.
-- Add parallel reviewer fan-out with per-reviewer deadlines while preserving deterministic aggregation.
+- Add optional global reviewer concurrency limits for deployments that use slow or rate-limited reviewer endpoints.
 
 ## Later
 
