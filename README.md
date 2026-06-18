@@ -67,7 +67,7 @@ Best for auditability, with no package build step:
 ```bash
 git clone https://github.com/wAngByg/llmveil.git
 cd llmveil
-git checkout v.0.1.20260617.1
+git checkout <tag-or-full-commit-sha>
 python3 -m llmveil self-test
 ```
 
@@ -76,7 +76,7 @@ PowerShell:
 ```powershell
 git clone https://github.com/wAngByg/llmveil.git
 cd llmveil
-git checkout v.0.1.20260617.1
+git checkout <tag-or-full-commit-sha>
 python -m llmveil self-test
 ```
 
@@ -85,7 +85,7 @@ Optional command installation from GitHub:
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install --no-deps "git+https://github.com/wAngByg/llmveil.git@v.0.1.20260617.1"
+python -m pip install --no-deps "git+https://github.com/wAngByg/llmveil.git@<tag-or-full-commit-sha>"
 llmveil self-test
 ```
 
@@ -94,7 +94,7 @@ PowerShell:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --no-deps "git+https://github.com/wAngByg/llmveil.git@v.0.1.20260617.1"
+python -m pip install --no-deps "git+https://github.com/wAngByg/llmveil.git@<tag-or-full-commit-sha>"
 llmveil self-test
 ```
 
@@ -121,7 +121,7 @@ Environment variables:
 | `LLMVEIL_UPSTREAM_API_KEY_ENV` | no | Name of an environment variable containing the upstream API key. Useful for saved configs that should not store secrets |
 | `LLMVEIL_UPSTREAM_AUTH_HEADER` | no | Upstream auth header override |
 | `LLMVEIL_UPSTREAM_AUTH_PREFIX` | no | Upstream auth value prefix override |
-| `LLMVEIL_LOCAL_API_KEY` | no | Optional local key required by clients calling this gateway |
+| `LLMVEIL_LOCAL_API_KEY` | no | Optional local key required by clients calling this gateway. Required when binding outside localhost |
 | `LLMVEIL_LOCAL_API_KEY_ENV` | no | Name of an environment variable containing the optional local API key |
 | `LLMVEIL_HOST` | no | Bind host. Defaults to `127.0.0.1` |
 | `LLMVEIL_PORT` | no | Bind port. Defaults to `8787` |
@@ -147,7 +147,7 @@ The gateway does not store upstream API keys. Redaction mappings are stored loca
 
 Default upstream authentication is `Authorization: Bearer <key>` for OpenAI-compatible upstreams and `x-api-key: <key>` for Anthropic-compatible upstreams. Override the header and prefix when a compatible relay expects a different convention.
 
-Remote upstream base URLs must use HTTPS. Plain HTTP is accepted only for localhost loopback endpoints such as `http://127.0.0.1:9000/v1`.
+Remote upstream base URLs must use HTTPS. Plain HTTP is accepted only for localhost loopback endpoints such as `http://127.0.0.1:9000/v1`. Base URLs with userinfo, params, query strings, fragments, control characters, backslashes, or invalid ports are rejected so request paths can be joined predictably.
 
 To avoid saving keys in config files, set a separate environment variable and reference its name:
 
@@ -213,6 +213,8 @@ LLMVeil 的请求侧保护先在本地完成字符串替换，再把脱敏后的
 ## Compatibility Scope
 
 The gateway is designed for text chat requests. Same-protocol forwarding keeps the original JSON shape except for local redaction and forcing upstream calls to non-stream mode. Cross-protocol conversion covers text messages, system text, basic sampling fields, and basic tool schema definitions.
+
+Tool and JSON Schema definitions are treated as protocol structure, not as user secrets. LLMVeil preserves schema object shape, property names, required lists, and structural values such as `type` and `$ref` so upstream tool definitions remain valid. Schema descriptions, defaults, enum values, and other free-form schema strings still pass through local redaction, so do not place real passwords, tokens, private addresses, or project secrets inside schema metadata.
 
 The gateway does not provide full multimodal, tool-call execution/result round-trip, structured-output, or upstream streaming passthrough compatibility. Image, audio, and file content blocks are not supported in cross-protocol conversion. When a local client asks for streaming, the gateway first receives a complete upstream response and then emits a short server-sent-events response in the requested local protocol.
 
@@ -314,11 +316,11 @@ The built-in server is still intentionally small and standard-library only, but 
 - TCP listen backlog control through `LLMVEIL_REQUEST_QUEUE_SIZE`.
 - Fast local `503 overloaded` responses when the process is already at its concurrency limit.
 - A request id on every gateway response through `X-LLMVeil-Request-Id`; clients may provide `x-request-id`.
-- Optional structured JSON access logs through `LLMVEIL_ACCESS_LOG=on`.
+- Optional structured JSON access logs through `LLMVEIL_ACCESS_LOG=on`; logs use normalized paths and do not store raw query strings or request bodies.
 - Local in-process Prometheus text metrics through `GET /metrics`.
 - Lightweight health and readiness endpoints through `GET /health` and `GET /ready`.
 
-If `LLMVEIL_LOCAL_API_KEY` is configured, operations endpoints use the same local authentication as API endpoints.
+If `LLMVEIL_LOCAL_API_KEY` is configured, operations endpoints use the same local authentication as API endpoints. Binding outside localhost requires a local API key.
 
 The metrics endpoint does not include prompts, responses, placeholders, keys, URLs, or reviewer reasons. It exposes process-level counters and gauges such as request counts, response counts, in-flight requests, overload rejections, redaction count, feedback records, local output-policy blocks, trusted-review blocks, uptime, and aggregate request latency.
 
@@ -380,7 +382,7 @@ Modes:
 
 High-risk findings include common prompt-injection attempts, secret or hidden-instruction exfiltration, external file or log sending, remote script piping, encoded command execution, broad destructive deletion, filesystem formatting, protected-path writes, broad permission changes, and package or system dependency installation requests. Package installation and external sending are blocked by default because untrusted upstream instructions should be reviewed locally before changing the user's environment or moving local data.
 
-Dependency installation is context-aware in the local return path. LLMVeil extracts package names only from current user-role request text and from the optional `x-llmveil-allowed-dependencies` header; assistant/tool/system text is not used as allowlist evidence, and negated install intent is ignored. If the response asks to install exactly those dependencies from the default package manager path, the local `package_install` finding is suppressed. If the response introduces a new package, changes the spelling, changes registry/index/source, installs from a URL or git source, uses a runner such as `npx`/`uvx`, uses a system package manager, adds upload/exec flags, or cannot be tied to the user's request, it is still blocked by `block-high`. For example, a user request that explicitly says `pip install requests` can allow `pip install requests`, but `pip install reqeusts` and `pip install --index-url=https://example.invalid requests` remain blocked.
+Dependency installation is context-aware in the local return path. LLMVeil extracts package names only from current user-role request text and from the optional `x-llmveil-allowed-dependencies` header; assistant/tool/system text and non-standard top-level fields such as `prompt`, `input`, or `content` are not used as allowlist evidence, and negated install intent is ignored. If the response asks to install exactly those dependencies from the default package manager path, the local `package_install` finding is suppressed. If the response introduces a new package, changes the spelling, changes registry/index/source, installs from a URL or git source, uses a runner such as `npx`/`uvx`, uses a system package manager, adds upload/exec flags, adds dangerous install flags such as `--break-system-packages`, `--force-reinstall`, or `--no-deps`, or cannot be tied to the user's request, it is still blocked by `block-high`. For example, a user request that explicitly says `pip install requests` can allow `pip install requests`, but `pip install reqeusts` and `pip install --index-url=https://example.invalid requests` remain blocked.
 
 Manual local audit remains available for scanning a text snippet without starting the gateway:
 
@@ -453,7 +455,7 @@ Aggregation behavior:
 
 `failure_policy` creates a synthetic reviewer decision when a reviewer times out, cannot be reached, or returns invalid data. The default is `block`, and reviewer failures block before aggregation so they cannot be diluted by `majority-block` or `advisory`. Set `failure_policy` to `warn` only when you intentionally want fail-open reviewer evaluation.
 
-`redacted` is the default reviewer payload. It sends response text and other agent-visible response strings, and applies a second transient strict redaction pass before reviewer calls. This reduces accidental exposure to reviewer endpoints, but redaction is still best-effort. Use `restored` only when the reviewer endpoint is explicitly trusted to see private content. Remote restored review requires both `allow_remote: true` and `allow_private_payload: true`.
+`redacted` is the default reviewer payload. It sends response text and other agent-visible response strings, prioritizes assistant-visible text before lower-value JSON metadata, and applies a second transient strict redaction pass before reviewer calls. That pass also applies configured exact redactions and the private values already replaced in the current request. This reduces accidental exposure to reviewer endpoints, but redaction is still best-effort. Use `restored` only when the reviewer endpoint is explicitly trusted to see private content. Remote restored review requires both `allow_remote: true` and `allow_private_payload: true`.
 
 Reviewer responses are expected to be strict JSON, either as the complete message content or as a single fenced JSON block:
 
@@ -467,13 +469,13 @@ Valid decisions are `allow`, `warn`, and `block`. `categories` must be a list of
 
 Without trusted reviewers, overhead is local JSON processing, redaction, output scanning, placeholder restoration, and optional simulated streaming. For normal text-chat payloads this should usually be small compared with the upstream model latency.
 
-With trusted reviewers enabled, the response path waits for the upstream relay first, then reviewer calls. Current reviewer calls are sequential and full-response based, so added latency is roughly:
+With trusted reviewers enabled, the response path waits for the upstream relay first, then reviewer calls. Reviewer calls run in parallel and are full-response based, so added latency is roughly:
 
 ```text
-local processing + upstream latency + sum(reviewer endpoint latency)
+local processing + upstream latency + max(reviewer endpoint latency)
 ```
 
-The implementation caps the upstream response body at `LLMVEIL_MAX_UPSTREAM_RESPONSE_BYTES`, caps reviewers at four, caps each reviewer timeout at 60 seconds, and applies a 120-second total reviewer budget. Worst-case latency can still be high when multiple reviewers are slow, and simulated streaming cannot emit the first local event until the upstream response and configured review steps finish.
+The implementation caps the upstream response body at `LLMVEIL_MAX_UPSTREAM_RESPONSE_BYTES`, caps reviewers at four, caps each reviewer timeout at 60 seconds, and applies a 120-second total reviewer budget. Worst-case latency can still be high when reviewer endpoints are slow, and simulated streaming cannot emit the first local event until the upstream response and configured review steps finish. If the total reviewer budget expires after a reviewer HTTP request has already started, LLMVeil discards that reviewer result for the local decision, but the underlying socket may remain occupied until that reviewer request returns or reaches its own timeout.
 
 Practical tuning:
 
@@ -512,7 +514,7 @@ Allowed feedback decisions are `false_positive`, `false_negative`, `confirmed_bl
 
 LLMVeil's built-in server includes bounded concurrency, overload rejection, request ids, health/readiness endpoints, local metrics, structured access logs, request-size limits, timeouts, local output blocking, and trusted-review fail-closed behavior.
 
-If you expose LLMVeil beyond a personal machine, enable local authentication, keep redaction maps private, collect metrics, and review logs for operational issues. Treat the gateway as a security-sensitive component: update it deliberately, pin release tags or commits, and avoid storing private data in examples, issue reports, or public logs.
+LLMVeil refuses to bind outside localhost unless a local API key is configured through `LLMVEIL_LOCAL_API_KEY` or `LLMVEIL_LOCAL_API_KEY_ENV`. If you expose LLMVeil beyond a personal machine, keep that local key private, keep redaction maps private, collect metrics, and review logs for operational issues. Treat the gateway as a security-sensitive component: update it deliberately, pin release tags or commits, and avoid storing private data in examples, issue reports, or public logs.
 
 ## Extra Redaction
 
